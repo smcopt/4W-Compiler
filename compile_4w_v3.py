@@ -75,6 +75,7 @@ SITE_CODE_RE = re.compile(r"\b([A-Z]{3}\d{4})\b")
 FILENAME_RE = re.compile(r"^((?:\d{6}_)+)Activities_([A-Za-z0-9\-_]+)\.xlsx$", re.IGNORECASE)
 MONTH_NAMES = {1:"January",2:"February",3:"March",4:"April",5:"May",6:"June",
                7:"July",8:"August",9:"September",10:"October",11:"November",12:"December"}
+MONTH_NUM = {v: k for k, v in MONTH_NAMES.items()}
 KEEP_MONTHS = {"March","April"}          # this cycle only
 KEEP_PERIODS = {202603, 202604}
 
@@ -831,6 +832,7 @@ def run(sub, mlp, indp, out, codp=None, keep_months=None):
             f"COD neighborhoods={cod_n}")
 
     log = IssueLog(); frames=[]; partners=set(); proc=skip=0
+    months_seen = Counter()
     for path in sorted(Path(sub).glob("*Activities*.xlsx")):
         parsed = parse_filename(path.name)
         if not parsed:
@@ -867,6 +869,7 @@ def run(sub, mlp, indp, out, codp=None, keep_months=None):
             method="filename"
         # keep only target months
         before=len(df)
+        months_seen.update(df["month_final"].dropna().tolist())
         df = df[df["month_final"].isin(keep)].reset_index(drop=True)
         if df.empty:
             lg.info(f"  [{path.name}] no in-scope months ({method}) — skipped"); skip+=1; continue
@@ -876,14 +879,29 @@ def run(sub, mlp, indp, out, codp=None, keep_months=None):
                                      ind_master, mst, name_idx_exact, name_idx_norm,
                                      norm_keys, ind_class, site_pop, log)
         cleaned["__source_file__"]=path.name
-        cleaned["reporting_year"]=2026
-        cleaned["reporting_period_id"]=cleaned["month_final"].map({"March":202603,"April":202604})
+        # reporting period/year derived generically from the row's month + the
+        # filename year (with a Dec-in-Jan-file guard for stale year boundaries)
+        fy = fmonths[0][1]; fm_num = min(mn for _,_,mn in fmonths)
+        def _period(mname):
+            mn = MONTH_NUM.get(mname)
+            if mn is None: return pd.NA
+            y = fy - 1 if (mn - fm_num) >= 6 else fy
+            return y*100 + mn
+        cleaned["reporting_period_id"]=cleaned["month_final"].map(_period).astype("Int64")
+        cleaned["reporting_year"]=(cleaned["reporting_period_id"]//100).astype("Int64")
         cleaned["__is_valid__"]=(cleaned["indicator_clean"].notna() & cleaned["total_count"].notna()
             & cleaned["site_code_clean"].isin(set(mst["Site ID"]))
             & cleaned["governorate_clean"].isin(set(GOV_CANON.values())))
         frames.append(cleaned); proc+=1
         lg.info(f"  [{path.name}] {len(cleaned)} rows kept ({method}); valid={int(cleaned['__is_valid__'].sum())}")
 
+    if not frames:
+        seen = ", ".join(f"{m} ({n})" for m, n in months_seen.most_common()) or "none"
+        raise ValueError(
+            "No rows matched the selected reporting months. "
+            f"Months to include = [{', '.join(sorted(keep))}]; "
+            f"months actually found in the uploaded files = [{seen}]. "
+            "Set 'Months to include' to one of the months found and re-run.")
     fact = pd.concat(frames,ignore_index=True,sort=False)
     lg.info(f"\nPre-dedup rows: {len(fact):,}")
 
@@ -920,7 +938,7 @@ def run(sub, mlp, indp, out, codp=None, keep_months=None):
     site_reach.to_csv(out/"_site_reach_readingB.csv",index=False)
 
     lg.info(f"\nFiles processed={proc} skipped={skip} issues={len(vlog)}")
-    lg.info(f"READING-B CLUSTER REACH (Mar+Apr, cumulative) = {headline:,}")
+    lg.info(f"READING-B CLUSTER REACH (cross-month, cumulative) = {headline:,}")
     lg.info(f"Sites with reported activity = {int(tables['dim_sites']['has_reported_activity'].sum())}")
     if not vlog.empty:
         lg.info("Top error types:")
