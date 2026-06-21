@@ -22,6 +22,7 @@ Deploy:        push to GitHub → share.streamlit.io  (link from smcopt.org)
 from __future__ import annotations
 import io
 import re
+import inspect
 import zipfile
 import tempfile
 from pathlib import Path
@@ -165,7 +166,15 @@ def run_pipeline(upload_files, ml_path, ind_path, cod_path, keep_months):
     if ind_path is None:
         raise FileNotFoundError("No indicator list (list_indicators_5w.csv) available in ./data.")
     disc_path = next(iter(sorted(DATA_DIR.glob("discontinued_indicators.csv"))), None)
-    pipeline.run(sub, ml_path, ind_path, out, codp=cod_path, keep_months=keep_months, discp=disc_path)
+    # Pass discp only if the installed compile_4w_v3.run() accepts it. This keeps
+    # the app working even when compile_4w_v3.py on the server is an older copy
+    # that predates the discontinued-indicator feature, instead of crashing with
+    # "run() got an unexpected keyword argument 'discp'".
+    run_params = inspect.signature(pipeline.run).parameters
+    run_kw = dict(codp=cod_path, keep_months=keep_months)
+    if "discp" in run_params:
+        run_kw["discp"] = disc_path
+    pipeline.run(sub, ml_path, ind_path, out, **run_kw)
     period = derive_period_label(out)
     safe = period.replace(" ", "").replace("\u2013", "").replace("-", "") or "output"
     xlsx = out / f"SMC_4W_{safe}_PowerBI.xlsx"
