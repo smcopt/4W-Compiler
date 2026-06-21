@@ -65,7 +65,29 @@ def build_workbook(outputs_dir, xlsx_path, period_label: str | None = None) -> d
     n_valid = int(fact["is_valid"].sum())
     n_partners = int(fact.loc[fact["is_valid"], "organization"].nunique())
 
-    present = [(s, stem, d) for s, stem, d in SHEETS if (out / f"{stem}.csv").exists()]
+    # Promote the per-site Reading-B reach to a normal, documented table so the
+    # de-duplicated headline reach is a simple column-sum in Power BI (no DAX).
+    sheets = list(SHEETS)
+    if rb.exists():
+        site_reach = pd.read_csv(rb)
+        # enrich with neighborhood + pcodes so this one table gives correct
+        # cross-month reach at site, neighborhood OR governorate level
+        ds = pd.read_csv(out / "dim_sites.csv")
+        addc = [c for c in ["site_name", "neighborhood", "neighborhood_pcode",
+                            "governorate_pcode"] if c in ds.columns]
+        site_reach = site_reach.merge(ds[["site_id"] + addc], on="site_id", how="left")
+        order = [c for c in ["site_id", "site_name", "governorate", "governorate_pcode",
+                             "neighborhood", "neighborhood_pcode",
+                             "capped", "cumulative", "reach"] if c in site_reach.columns]
+        site_reach = site_reach[order]
+        site_reach.to_csv(out / "agg_site_reach.csv", index=False)
+        sheets.insert(6, ("agg_site_reach", "agg_site_reach",
+            "Per-site de-duplicated reach (Reading B, cross-month). SUM of 'reach' = the "
+            "cluster headline reach; group by governorate OR neighborhood for correct "
+            "cross-month reach by area. Use THIS for any 'people reached' total — not the "
+            "monthly tables, which double-count people served in more than one month."))
+
+    present = [(s, stem, d) for s, stem, d in sheets if (out / f"{stem}.csv").exists()]
 
     with pd.ExcelWriter(xlsx_path, engine="openpyxl") as xw:
         pd.DataFrame({"_": [""]}).to_excel(xw, sheet_name="Contents", index=False)
