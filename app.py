@@ -129,7 +129,7 @@ with st.sidebar:
         months = st.multiselect("Keep only these reporting months", ALL_MONTHS,
                                  default=["March","April"])
     else:
-        months = ALL_MONTHS  # keep all; nothing is silently dropped
+        months = "auto"  # keep only months present in the filenames (drops typos)
     st.markdown("---")
     st.caption("Reference status:")
     st.caption(f"• masterlist: {'✅ bundled' if ml_def else '⚠️ missing'}"
@@ -169,13 +169,18 @@ def run_pipeline(upload_files, ml_path, ind_path, cod_path, keep_months):
     safe = period.replace(" ", "").replace("\u2013", "").replace("-", "") or "output"
     xlsx = out / f"SMC_4W_{safe}_PowerBI.xlsx"
     info = build_workbook(out, xlsx, period)
-    # master_summary (colleague's format, this cluster's codes + mapping tab)
-    summary_xlsx = None
+    # master_summary (colleague's format, this cluster's codes + mapping tab).
+    # Optional: never let it block the core deliverables.
+    summary_xlsx = None; summary_error = None
     coll_codes = next(iter(sorted(DATA_DIR.glob("colleague_indicator_codes.csv"))), None)
     if coll_codes is not None:
-        summary_xlsx = out / f"master_summary_{safe}.xlsx"
-        build_master_summary(out, ml_path, ind_path, coll_codes, summary_xlsx, period)
-    return out, xlsx, period, info, summary_xlsx
+        try:
+            cand = out / f"master_summary_{safe}.xlsx"
+            build_master_summary(out, ml_path, ind_path, coll_codes, cand, period)
+            summary_xlsx = cand
+        except Exception as e:
+            summary_error = str(e)
+    return out, xlsx, period, info, summary_xlsx, summary_error
 
 
 def staged_reference(ml_up, cod_up):
@@ -206,11 +211,12 @@ if go and uploads:
     try:
         ml_path, ind_path, cod_path = staged_reference(ml_up, cod_up)
         with st.spinner("Reading files, validating rows, compiling the star schema…"):
-            out, xlsx, period, info, summary_xlsx = run_pipeline(
+            out, xlsx, period, info, summary_xlsx, summary_error = run_pipeline(
                 uploads, ml_path, ind_path, cod_path, months)
         st.session_state["result"] = {
             "out": str(out), "xlsx": str(xlsx), "period": period, "info": info,
             "summary_xlsx": str(summary_xlsx) if summary_xlsx else None,
+            "summary_error": summary_error,
         }
     except Exception as e:
         st.error(f"Compilation failed: {e}")
@@ -256,6 +262,8 @@ if res:
             st.download_button("⬇ master_summary (.xlsx)", data=summary_xlsx.read_bytes(),
                                file_name=summary_xlsx.name,
                                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        elif res.get("summary_error"):
+            st.caption("master_summary skipped (core outputs unaffected)")
         else:
             st.caption("master_summary unavailable (colleague codes not bundled)")
     with d4:
