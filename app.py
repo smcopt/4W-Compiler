@@ -164,7 +164,8 @@ def run_pipeline(upload_files, ml_path, ind_path, cod_path, keep_months):
         raise FileNotFoundError("No site masterlist available (bundle one in ./data or upload it).")
     if ind_path is None:
         raise FileNotFoundError("No indicator list (list_indicators_5w.csv) available in ./data.")
-    pipeline.run(sub, ml_path, ind_path, out, codp=cod_path, keep_months=keep_months)
+    disc_path = next(iter(sorted(DATA_DIR.glob("discontinued_indicators.csv"))), None)
+    pipeline.run(sub, ml_path, ind_path, out, codp=cod_path, keep_months=keep_months, discp=disc_path)
     period = derive_period_label(out)
     safe = period.replace(" ", "").replace("\u2013", "").replace("-", "") or "output"
     xlsx = out / f"SMC_4W_{safe}_PowerBI.xlsx"
