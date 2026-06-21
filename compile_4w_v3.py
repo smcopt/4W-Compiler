@@ -391,7 +391,8 @@ def coerce(df, cols):
 
 # ---------------------------------------------------------------------------
 def validate_and_clean(raw, file, partner_fn, month_label, alias, ind_master,
-                       mst, exact_idx, norm_idx, norm_keys, ind_class, site_pop, log):
+                       mst, exact_idx, norm_idx, norm_keys, ind_class, site_pop, log,
+                       disc_alias=None, disc_master=None):
     df = raw.copy()
     for col in C.values():
         if col not in df.columns: df[col] = pd.NA
@@ -417,6 +418,13 @@ def validate_and_clean(raw, file, partner_fn, month_label, alias, ind_master,
 
     df["governorate_clean"] = df[C["gov"]].apply(normalise_gov)
     df["indicator_clean"]   = df[C["indicator"]].astype(str).str.strip().map(alias)
+    if disc_alias is not None:
+        # second stage: recognise discontinued indicators ONLY where the current
+        # Activity Index did not match — the current list always keeps priority
+        resid = df["indicator_clean"].isna() & df[C["indicator"]].notna()
+        if resid.any():
+            df.loc[resid, "indicator_clean"] = (
+                df.loc[resid, C["indicator"]].astype(str).str.strip().map(disc_alias))
     valid_ids = set(mst["Site ID"].dropna().astype(str).str.upper())
     df["site_code_extracted"] = df[C["site_text"]].apply(extract_site_code)
     res = df.apply(lambda r: resolve_site(r[C["site_text"]], r["site_code_extracted"],
@@ -426,17 +434,41 @@ def validate_and_clean(raw, file, partner_fn, month_label, alias, ind_master,
     df["site_match_score"] = [x[2] for x in res]
     coerce(df,[C["total"]]+DEMO_COLS+PWD_COLS+SEX_COLS)
 
-    # canonical indicator metadata
-    look = ind_master.set_index("Indicators")[["Activity_Code","Indicator_Code","Unit",
-                                                "Primary_Activity","Sub_Activity","Indicator Purpose"]]
+    # canonical indicator metadata — current Activity Index plus any
+    # discontinued indicators, carrying an indicator_status column
+    look = (ind_master.rename(columns={
+                "Activity_Code":"activity_code","Indicator_Code":"indicator_code","Unit":"canonical_unit",
+                "Primary_Activity":"canonical_primary","Sub_Activity":"canonical_sub",
+                "Indicator Purpose":"indicator_purpose"})
+            [["Indicators","activity_code","indicator_code","canonical_unit",
+              "canonical_primary","canonical_sub","indicator_purpose"]].copy())
+    look["indicator_status"] = "active"
+    if disc_master is not None:
+        dl = (disc_master.rename(columns={
+                  "indicator":"Indicators","original_code":"activity_code","unit":"canonical_unit",
+                  "primary_activity":"canonical_primary","sub_activity":"canonical_sub"})
+              [["Indicators","activity_code","indicator_code","canonical_unit",
+                "canonical_primary","canonical_sub","indicator_purpose"]].copy())
+        dl["indicator_status"] = "discontinued"
+        look = pd.concat([look, dl], ignore_index=True)
+    look = look.drop_duplicates("Indicators").set_index("Indicators")
     df = df.merge(look, how="left", left_on="indicator_clean", right_index=True)
-    df = df.rename(columns={"Activity_Code":"activity_code","Indicator_Code":"indicator_code",
-                            "Unit":"canonical_unit","Primary_Activity":"canonical_primary",
-                            "Sub_Activity":"canonical_sub","Indicator Purpose":"indicator_purpose"})
+    df["indicator_status"] = df["indicator_status"].fillna("active")
     df["counting_class"] = df["indicator_code"].map(ind_class).fillna("NOT_PEOPLE")
-    df["is_people_indicator"] = df["counting_class"].isin({"PEOPLE_CAPPED","PEOPLE_CUMULATIVE"})
+    # discontinued indicators are recognised and recorded, but excluded from the
+    # current-framework people-reach headline so prior figures are unchanged
+    df["is_people_indicator"] = (df["counting_class"].isin({"PEOPLE_CAPPED","PEOPLE_CUMULATIVE"})
+                                 & (df["indicator_status"]!="discontinued"))
 
-    # ----- unknown indicator
+    # ----- discontinued indicator (recognised + counted — informational, NOT an error)
+    if disc_master is not None:
+        for _, r in df.loc[df["indicator_status"]=="discontinued"].iterrows():
+            log.add(file=file,partner_from_filename=partner_fn,month_from_filename=month_label,
+                    organization=r.get(C["org"]) or partner_fn,site=r.get(C["site_text"],""),
+                    indicator=str(r.get("indicator_clean",""))[:120],
+                    error_type="DISCONTINUED_INDICATOR",severity="INFO",
+                    description="Indicator retired after Feb 2026; recognised and counted, flagged for reference")
+    # ----- unknown indicator (still unmatched after current + discontinued lists)
     for _, r in df.loc[df["indicator_clean"].isna() & df[C["indicator"]].notna()].iterrows():
         log.add(file=file,partner_from_filename=partner_fn,month_from_filename=month_label,
                 organization=r.get(C["org"]) or partner_fn,site=r.get(C["site_text"],""),
@@ -594,7 +626,7 @@ def reading_b_reach(valid):
     return headline, gov_month, site
 
 def build_star(fact, mst, ind_master, partners_seen, ind_class, lg,
-               cod_idx=None, cod_keys=None, log=None, ml_nbhd_idx=None):
+               cod_idx=None, cod_keys=None, log=None, ml_nbhd_idx=None, disc_master=None):
     cod_idx = cod_idx or {}; cod_keys = cod_keys or {}; ml_nbhd_idx = ml_nbhd_idx or {}
     # join masterlist geography (integer pcodes)
     geo = mst.set_index("Site ID")[["adm2","adm 4","Neighborhood","Governorate"]]
@@ -694,6 +726,8 @@ def build_star(fact, mst, ind_master, partners_seen, ind_class, lg,
         "sub_activity": fact["canonical_sub"].fillna(fact[C["sub"]]).fillna(""),
         "indicator": fact["indicator_clean"].fillna(fact[C["indicator"]]).fillna(""),
         "indicator_code": fact["indicator_code"].fillna(""),
+        "indicator_status": (fact["indicator_status"].fillna("active")
+                             if "indicator_status" in fact.columns else "active"),
         "activity_code": fact["activity_code"].fillna(""),
         "indicator_purpose": fact["indicator_purpose"].fillna("(unmapped)"),
         "framework_category": fact["indicator_purpose"].fillna("").apply(
@@ -747,8 +781,18 @@ def build_star(fact, mst, ind_master, partners_seen, ind_class, lg,
     di["framework_category"] = di["indicator_purpose"].fillna("").apply(
         lambda s: "Flash Appeal" if "Flash" in str(s) else
         ("SMC Coordination" if "Coordination" in str(s) else "Other"))
+    di["indicator_status"] = "active"
+    if disc_master is not None:
+        dd_ = disc_master.rename(columns={"original_code":"activity_code"}).copy()
+        dd_["framework_category"] = "Discontinued (pre-Mar 2026)"
+        dd_["indicator_status"] = "discontinued"
+        for c in ["activity_code","indicator_code","indicator","primary_activity","sub_activity",
+                  "unit","counting_class","indicator_purpose"]:
+            if c not in dd_.columns: dd_[c] = ""
+        di = pd.concat([di, dd_], ignore_index=True, sort=False)
     dim_indicators = di[["activity_code","indicator_code","indicator","primary_activity",
-                         "sub_activity","unit","counting_class","indicator_purpose","framework_category"]]
+                         "sub_activity","unit","counting_class","indicator_purpose",
+                         "framework_category","indicator_status"]]
 
     # dim_partners
     pset = set(fact_out["organization"].dropna().astype(str)) | set(partners_seen)
@@ -823,7 +867,7 @@ def build_star(fact, mst, ind_master, partners_seen, ind_class, lg,
             "agg_neighborhood_month":agg_nm,"agg_coverage":agg_cov}, headline, site_reach
 
 # ---------------------------------------------------------------------------
-def run(sub, mlp, indp, out, codp=None, keep_months=None):
+def run(sub, mlp, indp, out, codp=None, keep_months=None, discp=None):
     files = sorted(Path(sub).glob("*Activities*.xlsx"))
     if keep_months == "auto":
         # keep only months that appear in a FILENAME (the authoritative cycle
@@ -849,6 +893,15 @@ def run(sub, mlp, indp, out, codp=None, keep_months=None):
     ind_class = {**{k:"PEOPLE_CAPPED" for k in PEOPLE_CAPPED},
                  **{k:"PEOPLE_CUMULATIVE" for k in PEOPLE_CUMULATIVE},
                  **{k:"SITE_CLAMPED" for k in SITE_CLAMPED}}
+    # discontinued indicators (used Jan/Feb, retired after Feb): recognised and
+    # flagged — NOT errors. Optional reference file; current list keeps priority.
+    disc_master = None
+    if discp and Path(discp).exists():
+        disc_master = pd.read_csv(discp)
+        disc_master["indicator"] = disc_master["indicator"].astype(str).str.strip()
+        ind_class = {**ind_class,
+                     **dict(zip(disc_master["indicator_code"], disc_master["counting_class"]))}
+        lg.info(f"discontinued indicators loaded: {len(disc_master)} (recognised, flagged not errored)")
     name_idx_exact, name_idx_norm = build_name_index(mst)
     norm_keys = list(name_idx_norm)
     site_pop = mst.set_index("Site ID")["Total Inv"]
@@ -906,9 +959,12 @@ def run(sub, mlp, indp, out, codp=None, keep_months=None):
             lg.info(f"  [{path.name}] no in-scope months ({method}) — skipped"); skip+=1; continue
 
         alias = build_indicator_alias(df[C["indicator"]], ind_master["Indicators"])
+        disc_alias = (build_indicator_alias(df[C["indicator"]], disc_master["indicator"])
+                      if disc_master is not None else None)
         cleaned = validate_and_clean(df, path.name, partner_fn, month_label, alias,
                                      ind_master, mst, name_idx_exact, name_idx_norm,
-                                     norm_keys, ind_class, site_pop, log)
+                                     norm_keys, ind_class, site_pop, log,
+                                     disc_alias=disc_alias, disc_master=disc_master)
         cleaned["__source_file__"]=path.name
         # reporting period/year derived generically from the row's month + the
         # filename year (with a Dec-in-Jan-file guard for stale year boundaries)
@@ -954,7 +1010,7 @@ def run(sub, mlp, indp, out, codp=None, keep_months=None):
 
     tables, headline, site_reach = build_star(fact, mst, ind_master, partners, ind_class, lg,
                                                cod_idx=cod_idx, cod_keys=cod_keys, log=log,
-                                               ml_nbhd_idx=ml_nbhd_idx)
+                                               ml_nbhd_idx=ml_nbhd_idx, disc_master=disc_master)
 
     vlog = log.to_df()
     vsum = (vlog.groupby(["partner_from_filename","month_from_filename","error_type","severity"])
@@ -986,7 +1042,9 @@ if __name__=="__main__":
                    help="COD_Gaza.xlsx — Common Operational Dataset for adm4 neighborhood pcode fallback")
     p.add_argument("--months",type=str,default=None,
                    help="Comma-separated month names to keep (e.g. 'March,April'). Default: all valid months found.")
+    p.add_argument("--discontinued",type=Path,default=None,
+                   help="discontinued_indicators.csv — pre-Mar 2026 indicators to recognise and flag (not error)")
     p.add_argument("--out",type=Path,default=Path("./outputs"))
     a=p.parse_args()
     km = [m.strip().title() for m in a.months.split(",")] if a.months else None
-    run(a.submissions,a.masterlist,a.indicators,a.out,codp=a.cod,keep_months=km)
+    run(a.submissions,a.masterlist,a.indicators,a.out,codp=a.cod,keep_months=km,discp=a.discontinued)
