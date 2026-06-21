@@ -28,6 +28,7 @@ from __future__ import annotations
 import argparse, logging, re, sys
 from dataclasses import dataclass, field
 from difflib import SequenceMatcher
+from collections import Counter
 from pathlib import Path
 import unicodedata
 import numpy as np
@@ -281,10 +282,10 @@ def build_cod_neighborhood_index(cod_path):
 
 
 def build_masterlist_nbhd_index(mst):
-    """{governorate: {normalised_name: {adm4_pcode, ...}}} from the masterlist's
-    own Neighborhood + adm4 columns. Used only to break COD ambiguities: among
-    several COD candidates for one name, prefer the pcode the masterlist
-    actually uses operationally."""
+    """{governorate: {normalised_name: Counter{adm4_pcode: n_sites}}} from the
+    masterlist's own Neighborhood + adm4 columns. Used to break COD
+    ambiguities: among several COD candidates for one name, prefer the pcode
+    the masterlist actually uses (and, when needed, the one it uses most)."""
     idx = {}
     if not {"Neighborhood","adm 4","Governorate"}.issubset(mst.columns):
         return idx
@@ -292,7 +293,7 @@ def build_masterlist_nbhd_index(mst):
         g = normalise_gov(r["Governorate"]); k = norm_nbhd(r["Neighborhood"])
         if not (g and k) or pd.isna(r["adm 4"]):
             continue
-        idx.setdefault(g, {}).setdefault(k, set()).add(int(r["adm 4"]))
+        idx.setdefault(g, {}).setdefault(k, Counter())[int(r["adm 4"])] += 1
     return idx
 
 
@@ -315,9 +316,18 @@ def resolve_nbhd_pcode(gov, name, cod_idx, cod_keys, ml_idx=None):
     def pick(pcs, method, score):
         if len(pcs) == 1:
             return next(iter(pcs)), method, score
-        inter = pcs & ml_idx.get(gov, {}).get(q, set())
-        if len(inter) == 1:
-            return next(iter(inter)), method + "_ml", score
+        ml = ml_idx.get(gov, {}).get(q)          # Counter{adm4: n_sites} or None
+        if ml:
+            inter = pcs & set(ml)
+            if len(inter) == 1:
+                return next(iter(inter)), method + "_ml", score
+            # majority tiebreak: among the COD candidates, pick the adm4 that
+            # the most masterlist sites in this neighborhood actually use
+            counts = {pc: ml.get(pc, 0) for pc in pcs}
+            top = max(counts.values()) if counts else 0
+            winners = [pc for pc, c in counts.items() if c == top and top > 0]
+            if len(winners) == 1:
+                return winners[0], method + "_mlmajority", score
         return None, "ambiguous", score
 
     if q in gi:
@@ -616,7 +626,7 @@ def build_star(fact, mst, ind_master, partners_seen, ind_class, lg,
             for (g, n), (pc, meth, sc) in resolved.items():
                 if pc is not None:
                     is_fuzzy = meth.startswith("cod_fuzzy")
-                    tie = meth.endswith("_ml")
+                    tie = "_ml" in meth
                     log.add(file="(COD lookup)", partner_from_filename="—",
                             month_from_filename="Mar/Apr", organization="",
                             site=str(n),
@@ -625,7 +635,7 @@ def build_star(fact, mst, ind_master, partners_seen, ind_class, lg,
                             severity="INFO",
                             description=(f"Neighborhood '{n}' ({g}) had no site match; "
                                          f"adm4 pcode {pc} sourced from COD ({meth}"
-                                         f"{'' if meth in ('cod_exact','cod_exact_ml') else f' {sc}'})"
+                                         f"{'' if meth.startswith('cod_exact') else f' {sc}'})"
                                          f"{'; tie broken via masterlist usage' if tie else ''}"))
                 elif meth == "ambiguous":
                     ambiguous += 1
@@ -753,13 +763,18 @@ def build_star(fact, mst, ind_master, partners_seen, ind_class, lg,
     agg_gm = gov_month_reach.merge(gov_pop,left_on="governorate",right_on="g",how="left").drop(columns=["g"])
     agg_gm["governorate_pcode"] = agg_gm["governorate"].map(GOV_PCODE).astype("Int64")
     agg_gm["coverage_rate"] = (agg_gm["sites_covered"]/agg_gm["masterlist_sites"]).round(3)
+    gov_ag = (valid.groupby(["governorate","reporting_period_id"],dropna=False)["organization"]
+              .nunique().reset_index(name="unique_agencies"))
+    agg_gm = agg_gm.merge(gov_ag,on=["governorate","reporting_period_id"],how="left")
+    agg_gm["unique_agencies"] = agg_gm["unique_agencies"].fillna(0).astype(int)
     agg_gm = agg_gm[["governorate","governorate_pcode","reporting_period_id","reach",
-                     "sites_covered","masterlist_population","masterlist_sites","coverage_rate"]]
+                     "sites_covered","unique_agencies","masterlist_population","masterlist_sites","coverage_rate"]]
 
     agg_im = (valid.groupby(["indicator","indicator_code","activity_code","framework_category",
               "counting_class","reporting_period_id"],as_index=False)
               .agg(activities=("fact_id","count"),total=("total_count","sum"),
-                   unique_sites=("site_id",lambda x:x[x!=""].nunique())))
+                   unique_sites=("site_id",lambda x:x[x!=""].nunique()),
+                   unique_agencies=("organization",pd.Series.nunique)))
 
     # agg_neighborhood_month (the one previously missing)
     ppl = valid[valid["is_people_indicator"] & valid["total_count"].notna()]
@@ -768,6 +783,12 @@ def build_star(fact, mst, ind_master, partners_seen, ind_class, lg,
     agg_nm = (nb_sm.groupby(["governorate","governorate_pcode","neighborhood","neighborhood_pcode",
               "reporting_period_id"],dropna=False)
               .agg(reach=("total_count","sum"),sites_covered=("site_id","nunique")).reset_index())
+    nb_ag = (valid.groupby(["governorate","governorate_pcode","neighborhood","neighborhood_pcode",
+             "reporting_period_id"],dropna=False)["organization"]
+             .nunique().reset_index(name="unique_agencies"))
+    agg_nm = agg_nm.merge(nb_ag,on=["governorate","governorate_pcode","neighborhood",
+             "neighborhood_pcode","reporting_period_id"],how="left")
+    agg_nm["unique_agencies"] = agg_nm["unique_agencies"].fillna(0).astype(int)
 
     # agg_coverage (site x month grid)
     grid = (dim_sites[["site_id","site_name","governorate","governorate_pcode","site_status","population_total"]]
