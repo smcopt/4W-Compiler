@@ -21,6 +21,7 @@ Deploy:        push to GitHub → share.streamlit.io  (link from smcopt.org)
 """
 from __future__ import annotations
 import io
+import re
 import zipfile
 import tempfile
 from pathlib import Path
@@ -30,6 +31,7 @@ import streamlit as st
 
 import compile_4w_v3 as pipeline
 from build_powerbi_workbook import build_workbook, derive_period_label
+from build_master_summary import build_master_summary
 
 # ---------------------------------------------------------------- branding ---
 SAPPHIRE = "#1B657C"; SIENNA = "#EC6B4D"; ECRU = "#F5F3E8"; BALTIC = "#2C2C2C"
@@ -117,9 +119,17 @@ with st.sidebar:
     st.markdown("### Months to include")
     ALL_MONTHS = ["January","February","March","April","May","June",
                   "July","August","September","October","November","December"]
-    months = st.multiselect("Keep only these reporting months",
-                            ALL_MONTHS, default=["March","April"])
-    st.caption("Rows in other months are dropped. Leave March+April for the current cycle.")
+    month_mode = st.radio("Which reporting months?",
+                          ["All months found in the files", "Choose specific months"],
+                          index=0,
+                          help="The pipeline reads each row's reporting month from the file. "
+                               "‘All months found’ keeps everything you upload — safest default. "
+                               "Switch to ‘specific’ to restrict to one cycle.")
+    if month_mode == "Choose specific months":
+        months = st.multiselect("Keep only these reporting months", ALL_MONTHS,
+                                 default=["March","April"])
+    else:
+        months = ALL_MONTHS  # keep all; nothing is silently dropped
     st.markdown("---")
     st.caption("Reference status:")
     st.caption(f"• masterlist: {'✅ bundled' if ml_def else '⚠️ missing'}"
@@ -143,14 +153,13 @@ go = st.button("Compile & validate", disabled=not uploads)
 
 # --------------------------------------------------------------- compile -----
 def run_pipeline(upload_files, ml_path, ind_path, cod_path, keep_months):
-    """Stage uploads + reference into a temp workspace, run the pipeline, and
-    return (outputs_dir, workbook_bytes, period_label, info)."""
+    """Stage uploads + reference into a temp workspace, run the pipeline, build
+    the Power BI workbook and the master_summary workbook."""
     work = Path(tempfile.mkdtemp(prefix="smc4w_"))
     sub = work / "submissions"; out = work / "outputs"
     sub.mkdir(); out.mkdir()
     for uf in upload_files:
         (sub / uf.name).write_bytes(uf.getvalue())
-    # reference: prefer sidebar override, else bundled
     if ml_path is None:
         raise FileNotFoundError("No site masterlist available (bundle one in ./data or upload it).")
     if ind_path is None:
@@ -160,7 +169,13 @@ def run_pipeline(upload_files, ml_path, ind_path, cod_path, keep_months):
     safe = period.replace(" ", "").replace("\u2013", "").replace("-", "") or "output"
     xlsx = out / f"SMC_4W_{safe}_PowerBI.xlsx"
     info = build_workbook(out, xlsx, period)
-    return out, xlsx, period, info
+    # master_summary (colleague's format, this cluster's codes + mapping tab)
+    summary_xlsx = None
+    coll_codes = next(iter(sorted(DATA_DIR.glob("colleague_indicator_codes.csv"))), None)
+    if coll_codes is not None:
+        summary_xlsx = out / f"master_summary_{safe}.xlsx"
+        build_master_summary(out, ml_path, ind_path, coll_codes, summary_xlsx, period)
+    return out, xlsx, period, info, summary_xlsx
 
 
 def staged_reference(ml_up, cod_up):
@@ -191,9 +206,11 @@ if go and uploads:
     try:
         ml_path, ind_path, cod_path = staged_reference(ml_up, cod_up)
         with st.spinner("Reading files, validating rows, compiling the star schema…"):
-            out, xlsx, period, info = run_pipeline(uploads, ml_path, ind_path, cod_path, months)
+            out, xlsx, period, info, summary_xlsx = run_pipeline(
+                uploads, ml_path, ind_path, cod_path, months)
         st.session_state["result"] = {
             "out": str(out), "xlsx": str(xlsx), "period": period, "info": info,
+            "summary_xlsx": str(summary_xlsx) if summary_xlsx else None,
         }
     except Exception as e:
         st.error(f"Compilation failed: {e}")
@@ -204,8 +221,16 @@ if go and uploads:
 res = st.session_state.get("result")
 if res:
     out = Path(res["out"]); xlsx = Path(res["xlsx"]); info = res["info"]; period = res["period"]
+    summary_xlsx = Path(res["summary_xlsx"]) if res.get("summary_xlsx") else None
 
     st.markdown(f"#### 2 · Results — {period or 'compiled'}")
+    # which months actually landed (so the user can confirm scope)
+    try:
+        dd = pd.read_csv(out / "dim_dates.csv")
+        st.caption("Months compiled: " + ", ".join(
+            f"{m} {int(y)}" for m, y in zip(dd["reporting_month"], dd["reporting_year"])))
+    except Exception:
+        pass
     c1, c2, c3, c4 = st.columns(4)
     for col, label, val, accent in [
         (c1, "Cluster reach", f"{info['reach']:,}" if info['reach'] is not None else "—", True),
@@ -217,7 +242,7 @@ if res:
                      f"<div class='v'>{val}</div></div>", unsafe_allow_html=True)
 
     st.markdown("#### 3 · Download")
-    d1, d2, d3 = st.columns(3)
+    d1, d2, d3, d4 = st.columns(4)
     with d1:
         st.download_button("⬇ Power BI workbook (.xlsx)", data=xlsx.read_bytes(),
                            file_name=xlsx.name,
@@ -227,6 +252,13 @@ if res:
         st.download_button("⬇ fact_activities.csv", data=fa.read_bytes(),
                            file_name="fact_activities.csv", mime="text/csv")
     with d3:
+        if summary_xlsx and summary_xlsx.exists():
+            st.download_button("⬇ master_summary (.xlsx)", data=summary_xlsx.read_bytes(),
+                               file_name=summary_xlsx.name,
+                               mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        else:
+            st.caption("master_summary unavailable (colleague codes not bundled)")
+    with d4:
         buf = io.BytesIO()
         with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
             for csv in sorted(out.glob("*.csv")):
@@ -275,17 +307,40 @@ if res:
             st.dataframe(piv.sort_values("Must fix", ascending=False),
                          use_container_width=True)
 
-        # downloadable error workbook (one sheet per severity)
+        # downloadable error workbook: a Summary tab + one tab per agency
+        def _safe_sheet(name):
+            s = re.sub(r"[\\/?*\[\]:]", " ", str(name)).strip() or "unattributed"
+            return s[:31]
+
         ebuf = io.BytesIO()
+        vlog_a = vlog.copy()
+        vlog_a["agency"] = vlog_a["organization"].replace("", pd.NA)
+        vlog_a["agency"] = vlog_a["agency"].fillna(vlog_a["partner_from_filename"]).replace("", "(unattributed)")
         with pd.ExcelWriter(ebuf, engine="openpyxl") as xw:
-            (vlog.groupby(["partner_from_filename", "error_type", "severity"])
-                 .size().reset_index(name="count")
-             ).to_excel(xw, sheet_name="Summary", index=False)
-            for sev in ["ERROR", "WARNING", "INFO"]:
-                s = vlog[vlog["severity"] == sev]
-                (s if not s.empty else pd.DataFrame(columns=vlog.columns)).to_excel(
-                    xw, sheet_name=sev.title(), index=False)
-        st.download_button("⬇ Error report (.xlsx)", data=ebuf.getvalue(),
+            # Summary: counts per agency x severity
+            summ = (vlog_a.pivot_table(index="agency", columns="severity",
+                                       values="error_type", aggfunc="count", fill_value=0))
+            for c in ("ERROR", "WARNING", "INFO"):
+                if c not in summ.columns:
+                    summ[c] = 0
+            summ = (summ[["ERROR", "WARNING", "INFO"]]
+                    .rename(columns={"ERROR": "Must fix", "WARNING": "Warnings", "INFO": "Auto-fixed"})
+                    .sort_values("Must fix", ascending=False).reset_index())
+            summ.to_excel(xw, sheet_name="Summary", index=False)
+            # one tab per agency
+            cols = ["file", "row", "organization", "site", "indicator",
+                    "error_type", "severity", "description"]
+            cols = [c for c in cols if c in vlog_a.columns]
+            used = set()
+            for agency in summ["agency"]:
+                sub = vlog_a[vlog_a["agency"] == agency][cols]
+                sheet = _safe_sheet(agency)
+                base = sheet; i = 1
+                while sheet.lower() in used:
+                    sheet = f"{base[:28]}_{i}"; i += 1
+                used.add(sheet.lower())
+                sub.to_excel(xw, sheet_name=sheet, index=False)
+        st.download_button("⬇ Error report — one tab per agency (.xlsx)", data=ebuf.getvalue(),
                            file_name=f"SMC_4W_{period.replace(' ','')}_errors.xlsx",
                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 else:
