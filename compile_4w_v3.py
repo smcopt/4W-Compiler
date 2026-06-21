@@ -165,7 +165,22 @@ def _normalise_columns(df):
             # month column so the file is not silently skipped.
             if not matched and re.sub(r"\s+"," ",key).lower().startswith("reporting month"):
                 ren[c] = C["month"]
-    return df.rename(columns=ren)
+    return _dedup_cols(df.rename(columns=ren))
+
+def _dedup_cols(df):
+    """Two different raw headers can normalise to the same canonical name
+    (e.g. 'Reporting Month' + 'Reporting Month2', or a partner duplicating
+    'Total'). That leaves duplicate column names, so df[name] returns a
+    DataFrame instead of a Series and every later boolean check raises
+    'truth value of a Series is ambiguous'. Coalesce duplicates (first
+    non-null value, left to right) into a single Series per name."""
+    if not df.columns.duplicated().any():
+        return df
+    out = {}
+    for name in pd.unique(df.columns):
+        sub = df.loc[:, df.columns == name]
+        out[name] = sub.iloc[:, 0] if sub.shape[1] == 1 else sub.bfill(axis=1).iloc[:, 0]
+    return pd.DataFrame(out)
 
 def _trim(df):
     need = [c for c in (C["org"],C["site_text"],C["total"]) if c in df.columns]
@@ -809,7 +824,23 @@ def build_star(fact, mst, ind_master, partners_seen, ind_class, lg,
 
 # ---------------------------------------------------------------------------
 def run(sub, mlp, indp, out, codp=None, keep_months=None):
-    keep = set(keep_months) if keep_months else KEEP_MONTHS
+    files = sorted(Path(sub).glob("*Activities*.xlsx"))
+    if keep_months == "auto":
+        # keep only months that appear in a FILENAME (the authoritative cycle
+        # marker) — this drops stray in-file typo months (e.g. a single
+        # "October" row inside a January file) that would otherwise create
+        # spurious one-off periods.
+        keep = set()
+        for path in files:
+            pr = parse_filename(path.name)
+            if pr:
+                keep |= {mn for mn, _, _ in pr[1]}
+        if not keep:
+            keep = set(MONTH_NAMES.values())
+    elif keep_months:
+        keep = set(keep_months)
+    else:
+        keep = KEEP_MONTHS
     lg = setup_logger(out)
     lg.info("== Gaza SMC 4W pipeline v3 ==  months kept: " + ", ".join(sorted(keep)))
     mst = pd.read_csv(mlp,low_memory=False)
@@ -833,7 +864,7 @@ def run(sub, mlp, indp, out, codp=None, keep_months=None):
 
     log = IssueLog(); frames=[]; partners=set(); proc=skip=0
     months_seen = Counter()
-    for path in sorted(Path(sub).glob("*Activities*.xlsx")):
+    for path in files:
         parsed = parse_filename(path.name)
         if not parsed:
             lg.warning(f"  [{path.name}] bad filename — skipped"); skip+=1; continue
